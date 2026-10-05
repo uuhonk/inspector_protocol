@@ -1,0 +1,11 @@
+[package]
+name = "inspector_protocol"
+version = "0.1.0"
+edition = "2021"
+description = "编译期 inspector schema（Inspector derive + trait）。没有渲染，也没有网络 —— inspector_protocol_server crate 会把它们转成 Just Inspector 协议。"
+license = "MIT"
+
+[dependencies]
+bevy_ecs = "0.19"
+inspector_protocol_derive = { path = "derive" }
+serde = { version = "1", features = ["derive"] }
