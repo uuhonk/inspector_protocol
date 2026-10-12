@@ -92,3 +92,8 @@ unsnap_panel(&mut commands, handles.root);
 `resize_handle` 等实体句柄；把 `body` 传给 `draw_inspector` 即可把字段列表放进面板。
 
 这些交互系统由 `InspectorPlugin` 自动注册（内部使用 `PanelPlugin`）。
+
+## Bevy 兼容版本
+
+当前依赖 Bevy ECS 0.20；工具链通过 `rust-toolchain.toml` 固定 Rust 1.97.1。
+`inspector_protocol_server` 与调用方应使用同一 Bevy minor 版本，避免 ECS 类型不兼容。
