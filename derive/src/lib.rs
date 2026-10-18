@@ -96,6 +96,8 @@ fn expand_inspector(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let mut apply_arms = Vec::new();
     // 每个带按钮的字段一个 `const` 项，声明在 `inspector_fields` 的函数体里。
     let mut button_decls: Vec<TokenStream2> = Vec::new();
+    let mut action_arms = Vec::new();
+    let mut action_ids = std::collections::HashSet::new();
 
     // `#[inspector_group("X")]` 打开一个 section，其后每个字段都会加入它，
     // 直到下一个 group 属性，所以先把整列都解析出来。
@@ -112,6 +114,14 @@ fn expand_inspector(input: &DeriveInput) -> syn::Result<TokenStream2> {
         // 按钮表是一个 `const` 项（不能靠 `&[..]` 的常量提升：它在函数体里会被
         // 当成临时值）。
         let buttons = parse_buttons(&field.attrs, &rt, &format_ident!("BUTTONS_FOR_{ident}"))?;
+        for (id, run) in &buttons.actions {
+            if !action_ids.insert(id.value()) {
+                return Err(syn::Error::new(id.span(), "duplicate inspector action id"));
+            }
+            if let Some(run) = run {
+                action_arms.push(quote! { #id => #run(context), });
+            }
+        }
         if let Some(decl) = &buttons.decl {
             button_decls.push(decl.clone());
         }
@@ -260,6 +270,35 @@ fn expand_inspector(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // 挂在类型上的按钮（`#[inspector(button(..))]` 写在 struct 上）：前端渲染成
     // 面板顶部的一行。
     let struct_buttons = parse_buttons(&input.attrs, &rt, &format_ident!("BUTTONS_FOR_TYPE"))?;
+    for (id, run) in &struct_buttons.actions {
+        if !action_ids.insert(id.value()) {
+            return Err(syn::Error::new(id.span(), "duplicate inspector action id"));
+        }
+        if let Some(run) = run {
+            action_arms.push(quote! { #id => #run(context), });
+        }
+    }
+    let context = parse_context(&input.attrs)?;
+    let action_impl = if action_arms.is_empty() {
+        None
+    } else {
+        let context = context.ok_or_else(|| {
+            syn::Error::new(
+                input.ident.span(),
+                "buttons with run require #[inspector(context = YourContext)]",
+            )
+        })?;
+        Some(quote! {
+            impl #rt::InspectorActions<#context> for #name {
+                fn invoke_action(context: &mut #context, action: &str) -> ::core::result::Result<::std::string::String, ::std::string::String> {
+                    match action {
+                        #(#action_arms)*
+                        _ => ::core::result::Result::Err(::std::format!("Unknown inspector action {action}")),
+                    }
+                }
+            }
+        })
+    };
     let struct_buttons_decl = struct_buttons.decl.iter();
     let struct_buttons_expr = &struct_buttons.expr;
 
@@ -282,6 +321,7 @@ fn expand_inspector(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 #struct_buttons_expr
             }
         }
+        #action_impl
     })
 }
 
@@ -676,9 +716,243 @@ fn expand_variants(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// #[inspector(button(..))]
+// ---------------------------------------------------------------------------
+
+/// 解析一个 `#[inspector(button(..))]` 按钮：
+///
+/// ```ignore
+/// #[inspector(button(label = "生成 wave", run = inspector_wave))]
+/// #[inspector(button(label = "清空", run = inspector_wave_clear, confirm))]
+/// #[inspector(button(label = "发射", run = path::to::fire, hint = "…", id = "fire"))]
+/// ```
+///
+/// - `label` 必填；`run` 可选，是 `fn(&mut Context) -> Result<String, String>` 的路径。
+///   带 `run` 时类型必须声明 `#[inspector(context = Context)]`；
+/// - `id` 缺省时取 `run` 路径的最后一段；不提供 `run` 时必须显式指定 `id`；
+/// - `hint` 是 tooltip / 状态行；
+/// - `confirm` 是裸标志，表示破坏性操作（前端先要一次确认）。
+///
+/// 返回值有两半：
+///
+/// - `decl`：一个 `const #name: &[InspectorButton] = &[..];` 项（没有按钮时是 `None`）。
+///   之所以要显式声明 const，是因为 `&[..]` **不会**在函数体里被常量提升成
+///   `&'static`（rustc 把它当作临时值，借用检查会报错）；
+/// - `expr`：塞进 `FieldInfo::buttons` / `Inspector::inspector_buttons` 的表达式
+///   （没有按钮时是 `&[]`）。
+struct ButtonTable {
+    decl: Option<TokenStream2>,
+    expr: TokenStream2,
+    actions: Vec<(syn::LitStr, Option<syn::Path>)>,
+}
+
+fn parse_context(attrs: &[syn::Attribute]) -> syn::Result<Option<syn::Type>> {
+    let mut context = None;
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("inspector"))
+    {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("context") {
+                if context.is_some() {
+                    return Err(meta.error("duplicate inspector context"));
+                }
+                context = Some(meta.value()?.parse()?);
+            } else if meta.input.peek(syn::token::Paren) {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let _: TokenStream2 = content.parse()?;
+            } else {
+                return Err(meta.error("expected context = Type or button(..)"));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(context)
+}
+
+fn parse_buttons(
+    attrs: &[syn::Attribute],
+    rt: &TokenStream2,
+    const_name: &syn::Ident,
+) -> syn::Result<ButtonTable> {
+    let mut buttons = Vec::new();
+    let mut actions = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("inspector") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("button") {
+                if meta.path.is_ident("context") {
+                    let _: syn::Type = meta.value()?.parse()?;
+                    return Ok(());
+                }
+                // 其他控件属性由 `parse_field_attrs` 负责；这里要跳过它的参数，
+                // 否则 `parse_nested_meta` 会因为括号对不上而报错。
+                if meta.input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in meta.input);
+                    let _: proc_macro2::TokenStream = content.parse()?;
+                }
+                return Ok(());
+            }
+
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let mut label: Option<syn::LitStr> = None;
+            let mut run: Option<syn::Path> = None;
+            let mut id: Option<syn::LitStr> = None;
+            let mut hint: Option<syn::LitStr> = None;
+            let mut confirm = false;
+
+            while !content.is_empty() {
+                let key: syn::Ident = content.parse()?;
+                match key.to_string().as_str() {
+                    "confirm" => confirm = true,
+                    "label" => {
+                        content.parse::<syn::Token![=]>()?;
+                        label = Some(content.parse()?);
+                    }
+                    "id" => {
+                        content.parse::<syn::Token![=]>()?;
+                        id = Some(content.parse()?);
+                    }
+                    "hint" => {
+                        content.parse::<syn::Token![=]>()?;
+                        hint = Some(content.parse()?);
+                    }
+                    "run" => {
+                        content.parse::<syn::Token![=]>()?;
+                        run = Some(content.parse()?);
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            format!(
+                                "unknown button key `{other}` (expected `label`, `run`, `id`, \
+                                 `hint` or `confirm`)"
+                            ),
+                        ));
+                    }
+                }
+                if content.peek(syn::Token![,]) {
+                    content.parse::<syn::Token![,]>()?;
+                }
+            }
+
+            let Some(label) = label else {
+                return Err(syn::Error::new(
+                    meta.path.span(),
+                    "button(..) 需要 label = \"按钮文字\"",
+                ));
+            };
+            // id 缺省 = 函数名（路径最后一段）—— 前端只回传它，所以同一个类型里要唯一。
+            let id = match id {
+                Some(id) => id,
+                None => {
+                    let run = run.as_ref().ok_or_else(|| {
+                        syn::Error::new(
+                            meta.path.span(),
+                            "button(..) requires id when run is omitted",
+                        )
+                    })?;
+                    let last = run
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident.to_string())
+                        .unwrap_or_else(|| "button".to_string());
+                    syn::LitStr::new(&last, run.segments.last().unwrap().ident.span())
+                }
+            };
+            actions.push((id.clone(), run));
+            let hint = match hint {
+                Some(hint) => quote! { .hint(#hint) },
+                None => quote! {},
+            };
+            let confirm = if confirm {
+                quote! { .confirm() }
+            } else {
+                quote! {}
+            };
+            buttons.push(quote! {
+                #rt::InspectorButton::new(#id, #label) #hint #confirm
+            });
+            Ok(())
+        })?;
+    }
+
+    if buttons.is_empty() {
+        return Ok(ButtonTable {
+            decl: None,
+            expr: quote! { &[] },
+            actions,
+        });
+    }
+    Ok(ButtonTable {
+        decl: Some(quote! {
+            const #const_name: &[#rt::InspectorButton] = &[ #(#buttons),* ];
+        }),
+        expr: quote! { #const_name },
+        actions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_expansion_parses_with_context() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[inspector(context = MyContext)]
+            #[inspector(button(label = "Run", run = execute))]
+            struct Settings { enabled: bool }
+        };
+        let expanded = expand_inspector(&input).unwrap();
+        syn::parse2::<syn::File>(expanded).unwrap();
+    }
+
+    #[test]
+    fn action_without_context_and_duplicate_ids_are_rejected() {
+        let missing: DeriveInput = syn::parse_quote! {
+            #[inspector(button(label = "Run", run = execute))]
+            struct Settings { enabled: bool }
+        };
+        assert!(expand_inspector(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("context"));
+        let duplicate: DeriveInput = syn::parse_quote! {
+            #[inspector(button(id = "same", label = "A"))]
+            struct Settings {
+                #[inspector(button(id = "same", label = "B"))]
+                enabled: bool
+            }
+        };
+        assert!(expand_inspector(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn context_is_not_implicitly_inferred_and_metadata_requires_id() {
+        let missing: DeriveInput = syn::parse_quote! {
+            #[inspector(button(label = "Run"))]
+            struct Settings { enabled: bool }
+        };
+        assert!(expand_inspector(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("id"));
+        let duplicate: DeriveInput = syn::parse_quote! {
+            #[inspector(context = First, context = Second)]
+            struct Settings { enabled: bool }
+        };
+        assert!(expand_inspector(&duplicate).is_err());
+    }
 
     /// `#[derive(Variants)]` 必须展开成真正能解析的代码。`from_index`
     /// 的 match 需要在生成的 arm 之后加一个末尾逗号，
@@ -843,156 +1117,4 @@ mod tests {
         };
         assert!(parse_group_attr(&field).is_err());
     }
-}
-
-// ---------------------------------------------------------------------------
-// #[inspector(button(..))]
-// ---------------------------------------------------------------------------
-
-/// 解析一个 `#[inspector(button(..))]` 按钮：
-///
-/// ```ignore
-/// #[inspector(button(label = "生成 wave", run = inspector_wave))]
-/// #[inspector(button(label = "清空", run = inspector_wave_clear, confirm))]
-/// #[inspector(button(label = "发射", run = path::to::fire, hint = "…", id = "fire"))]
-/// ```
-///
-/// - `label`（必填）是按钮文字；`run`（必填）是执行体路径
-///   （`fn(&mut World) -> Result<String, String>`，无捕获函数或非捕获闭包都行）；
-/// - `id` 缺省时取 `run` 路径的**最后一段**（前端回传的就是它，同一个类型里要唯一）；
-/// - `hint` 是 tooltip / 状态行；
-/// - `confirm` 是裸标志，表示破坏性操作（前端先要一次确认）。
-///
-/// 返回值有两半：
-///
-/// - `decl`：一个 `const #name: &[InspectorButton] = &[..];` 项（没有按钮时是 `None`）。
-///   之所以要显式声明 const，是因为 `&[..]` **不会**在函数体里被常量提升成
-///   `&'static`（rustc 把它当作临时值，借用检查会报错）；
-/// - `expr`：塞进 `FieldInfo::buttons` / `Inspector::inspector_buttons` 的表达式
-///   （没有按钮时是 `&[]`）。
-struct ButtonTable {
-    decl: Option<TokenStream2>,
-    expr: TokenStream2,
-}
-
-fn parse_buttons(
-    attrs: &[syn::Attribute],
-    rt: &TokenStream2,
-    const_name: &syn::Ident,
-) -> syn::Result<ButtonTable> {
-    let mut buttons = Vec::new();
-    for attr in attrs {
-        if !attr.path().is_ident("inspector") {
-            continue;
-        }
-        attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("button") {
-                // 其他控件属性由 `parse_field_attrs` 负责；这里要跳过它的参数，
-                // 否则 `parse_nested_meta` 会因为括号对不上而报错。
-                if meta.input.peek(syn::token::Paren) {
-                    let content;
-                    syn::parenthesized!(content in meta.input);
-                    let _: proc_macro2::TokenStream = content.parse()?;
-                }
-                return Ok(());
-            }
-
-            let content;
-            syn::parenthesized!(content in meta.input);
-            let mut label: Option<syn::LitStr> = None;
-            let mut run: Option<syn::Path> = None;
-            let mut id: Option<syn::LitStr> = None;
-            let mut hint: Option<syn::LitStr> = None;
-            let mut confirm = false;
-
-            while !content.is_empty() {
-                let key: syn::Ident = content.parse()?;
-                match key.to_string().as_str() {
-                    "confirm" => confirm = true,
-                    "label" => {
-                        content.parse::<syn::Token![=]>()?;
-                        label = Some(content.parse()?);
-                    }
-                    "id" => {
-                        content.parse::<syn::Token![=]>()?;
-                        id = Some(content.parse()?);
-                    }
-                    "hint" => {
-                        content.parse::<syn::Token![=]>()?;
-                        hint = Some(content.parse()?);
-                    }
-                    "run" => {
-                        content.parse::<syn::Token![=]>()?;
-                        run = Some(content.parse()?);
-                    }
-                    other => {
-                        return Err(syn::Error::new(
-                            key.span(),
-                            format!(
-                                "unknown button key `{other}` (expected `label`, `run`, `id`, \
-                                 `hint` or `confirm`)"
-                            ),
-                        ));
-                    }
-                }
-                if content.peek(syn::Token![,]) {
-                    content.parse::<syn::Token![,]>()?;
-                }
-            }
-
-            let Some(label) = label else {
-                return Err(syn::Error::new(
-                    meta.path.span(),
-                    "button(..) 需要 label = \"按钮文字\"",
-                ));
-            };
-            let Some(run) = run else {
-                return Err(syn::Error::new(
-                    meta.path.span(),
-                    "button(..) 需要 run = 函数路径",
-                ));
-            };
-            // id 缺省 = 函数名（路径最后一段）—— 前端只回传它，所以同一个类型里要唯一。
-            let id = match id {
-                Some(id) => id,
-                None => {
-                    let last = run
-                        .segments
-                        .last()
-                        .map(|segment| segment.ident.to_string())
-                        .unwrap_or_else(|| "button".to_string());
-                    syn::LitStr::new(&last, run.segments.last().unwrap().ident.span())
-                }
-            };
-            let hint = match hint {
-                Some(hint) => quote! { .hint(#hint) },
-                None => quote! {},
-            };
-            let confirm = if confirm {
-                quote! { .confirm() }
-            } else {
-                quote! {}
-            };
-            buttons.push(quote! {
-                #rt::InspectorButton::new(
-                    #rt::InspectorAction::new(#id, #label) #hint #confirm,
-                    #run,
-                )
-            });
-            Ok(())
-        })?;
-    }
-
-    if buttons.is_empty() {
-        return Ok(ButtonTable {
-            decl: None,
-            expr: quote! { &[] },
-        });
-    }
-    Ok(ButtonTable {
-        decl: Some(quote! {
-            const #const_name: &[#rt::InspectorButton] = &[ #(#buttons),* ];
-        }),
-        expr: quote! { #const_name },
-    })
 }

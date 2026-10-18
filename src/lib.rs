@@ -1,10 +1,8 @@
-//! 游戏配置资源用的编译期 inspector schema。
+//! 普通 Rust 数据用的编译期 inspector schema，不依赖引擎。
 //!
 //! 这个 crate 只描述*什么*可以被检查 —— 它没有渲染代码，也没有网络代码。
-//! Bevy-UI 渲染层已被移除，改用基于 HTML 的
-//! [Just Inspector](https://github.com/uuhonk/inspector_protocol_server)
-//! 前端：`inspector_protocol_server` crate 把这些 schema 转成 JSON WebSocket
-//! 协议（`Runtime.getTree` / `Runtime.getNode` / `Runtime.setValue`）。
+//! UI、ECS 存储访问、网络和持久化由消费者实现。按钮描述不持有执行函数；
+//! [`InspectorActions`] 使用调用方显式提供的上下文，不引用 Bevy World。
 //!
 //! 用法：
 //! ```ignore
@@ -45,8 +43,6 @@
 
 pub use inspector_protocol_derive::{Inspector, Variants};
 
-use bevy_ecs::component::Mutable;
-use bevy_ecs::prelude::{Resource, World};
 use serde::{Deserialize, Serialize};
 
 /// [`Curve`] 的一个控制点，与 inspector 前端的 `CurvePoint` 对应
@@ -340,19 +336,7 @@ pub trait Variants: Sized {
     fn from_index(index: usize) -> Self;
 }
 
-/// 一个注册类型附带的**按钮**。
-///
-/// 前端在这个 resource 的面板里渲染一行按钮；点下去只回传它的 [`id`](Self::id)，
-/// 服务端再调用 app 为这个 id 注册的执行体。所以：
-///
-/// - 前端是**完全通用**的 —— 它不知道"生成 wave"是什么意思，也不知道要读哪些
-///   字段；
-/// - 执行体是一个 Rust 函数（`fn(&mut World) -> Result<String, String>`，见
-///   `inspector_protocol_server` 的 `InspectorRegistration::action`），它和类型定义放在
-///   一起，于是天然能读到该 resource 的**当前**值 —— 不需要把参数序列化成命令
-///   文本、在另一边再解析回来。
-///
-/// `confirm` 为真的按钮，前端应当先要一次确认（用于"清空"这类破坏性操作）。
+/// 按钮的纯数据描述；执行上下文由使用方提供。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InspectorAction {
     /// 稳定 id（同一个类型内唯一）。前端回传的就是它。
@@ -365,43 +349,13 @@ pub struct InspectorAction {
     pub confirm: bool,
 }
 
-/// 按钮的执行体：拿整只 world —— 它既要读该 resource 的**当前**值，也常常要
-/// spawn 实体，所以比"传一份参数"更省事，也不需要把参数序列化成命令文本。
-///
-/// 它是一个普通函数指针，定义在 schema crate 里只是为了让
-/// [`InspectorButton`] 能把它和"长什么样"放在一起；真正调用它的是
-/// `inspector_protocol_server`。
-pub type ButtonFn = fn(&mut World) -> Result<String, String>;
+/// 字段级和类型级按钮使用相同描述，不持有引擎函数指针。
+pub type InspectorButton = InspectorAction;
 
-/// 一个按钮：外观 + 执行体。
-///
-/// 它是**在结构体定义里**挂上去的（`#[inspector(button(label = "…", run = …))]`），
-/// 所以位置也由结构体决定：
-///
-/// - 挂在**某个字段**上 → 前端把这个按钮渲染在那一行**之后**（想放"两个字段中间"
-///   就挂在前面那个字段上）；
-/// - 挂在**结构体**上 → 渲染在面板顶部单独一行。
-#[derive(Clone, Copy, Debug)]
-pub struct InspectorButton {
-    pub action: InspectorAction,
-    pub run: ButtonFn,
+/// 动作处理与字段 schema 分离，`Context` 可以是普通数据或宿主引擎上下文。
+pub trait InspectorActions<Context> {
+    fn invoke_action(context: &mut Context, action: &str) -> Result<String, String>;
 }
-
-impl InspectorButton {
-    pub const fn new(action: InspectorAction, run: ButtonFn) -> Self {
-        Self { action, run }
-    }
-}
-
-/// 只比较**外观**（id / 文案 / 提示 / confirm）：`run` 是函数指针，比它没有意义
-/// （同一个函数的两份地址不保证相等）。`FieldInfo` 的 diff 关心的也只是描述符。
-impl PartialEq for InspectorButton {
-    fn eq(&self, other: &Self) -> bool {
-        self.action == other.action
-    }
-}
-
-impl Eq for InspectorButton {}
 
 impl InspectorAction {
     pub const fn new(id: &'static str, label: &'static str) -> Self {
@@ -424,11 +378,8 @@ impl InspectorAction {
     }
 }
 
-/// 字段可被 inspector 编辑的一个 resource。
-///
-/// `Mutability = Mutable` 这个约束与 `#[derive(Resource)]` 匹配，
-/// 并让写回路径可以用 `ResMut<T>`。
-pub trait Inspector: Resource<Mutability = Mutable> {
+/// 字段可被 inspector 编辑的值；ECS 存储约束由使用方的适配器负责。
+pub trait Inspector {
     fn inspector_fields(&self) -> Vec<FieldInfo>;
     fn apply_field(&mut self, field: &str, value: FieldValue);
 

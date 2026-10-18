@@ -1,15 +1,15 @@
 # inspector_protocol
 
 一个编译期的检查器 schema crate：用 `#[derive(Inspector)]` 在编译期收集结构体字段（无运行时反射），
-生成字段元数据与写回函数。它本身不做渲染、不联网——`inspector_protocol_server` 会把这些元数据转成
-Just Inspector 的 JSON WebSocket 协议，由 HTML 前端（`just_inspector` 仓库）渲染成控件。
+生成字段元数据与写回函数。**不依赖 Bevy，也不做渲染、ECS 存储访问或网络通信**。
+原生 UI 或其他消费者直接使用同一套字段类型；运行时依赖只有 Serde 和本仓库的 derive。
 
 ## 快速上手
 
 ```rust
 use inspector_protocol::Inspector;
 
-#[derive(Resource, Inspector)]
+#[derive(Inspector)]
 struct MyConfig {
     /// 布尔值 -> 复选框
     pub enabled: bool,
@@ -29,8 +29,9 @@ struct MyConfig {
 ## 原理
 
 `#[derive(Inspector)]` 在编译期收集字段（无运行时反射），生成
-`Inspector::inspector_fields()` 和 `Inspector::apply_field()`。写回通过 `ResMut<T>` 完成，
-因此 `T` 必须是 `Resource`（`Mutability = Mutable`）。
+`Inspector::inspector_fields()` 和 `Inspector::apply_field()`。trait 本身不要求 `Resource` 或
+`Component`，也可以用于普通结构体。ECS 约束属于使用方适配器：Resource 适配器通过
+`ResMut<T>` 写回；Entity 适配器通过实体 ID 和 `get_mut::<T>()` 写回可变组件。
 
 ### 支持的字段类型
 
@@ -55,6 +56,40 @@ struct MyConfig {
 pub grain: f32,   // 属于 "Soil"
 pub color: LinearRgba,   // 也属于 "Soil"
 ```
+
+## 按钮与执行上下文
+
+`FieldInfo.buttons` 与 `Inspector::inspector_buttons()` 只返回 `InspectorButton` 元数据，
+包含 `id`、`label`、`hint` 和 `confirm`，不持有函数指针。点击由消费者转成动作请求。
+需要自动生成分发时，使用普通 Rust 上下文：
+
+```rust
+use inspector_protocol::{Inspector, InspectorActions};
+
+struct Context { calls: usize }
+fn reset(context: &mut Context) -> Result<String, String> {
+    context.calls += 1;
+    Ok("reset".into())
+}
+
+#[derive(Inspector)]
+#[inspector(context = Context)]
+#[inspector(button(label = "Reset", run = reset, confirm))]
+struct Settings { enabled: bool }
+
+let mut context = Context { calls: 0 };
+Settings::invoke_action(&mut context, "reset").unwrap();
+assert_eq!(context.calls, 1);
+```
+
+Bevy 使用者可将 `Context` 换成其自身依赖的 `bevy::prelude::World`；宏只是原样生成这个类型路径，
+协议与 derive 不引入 Bevy。字段上的按钮同样参加分发；类型内重复 ID 在编译时报错，未知动作返回错误。
+如果由宿主另行处理动作，可只写 `#[inspector(button(id = "save", label = "Save"))]`，不需要上下文。
+
+本次按钮 API 是源码不兼容调整：旧 `ButtonFn` 和 `InspectorButton.run` 已移除，调用者改用
+`InspectorActions<Context>` 或自己的 ID 处理器。原字段 derive、Variants、曲线、分组与数值属性能力保留。
+`inspector_protocol_server` 本轮未迁移；继续使用锁定的旧协议 Git 提交，不要将它单独替换成本地新协议。
+与 server 无关的消费者也必须统一依赖来源，避免 Git／path 两份同名协议类型混用。
 
 ## 旧版 Bevy UI 面板
 
@@ -95,5 +130,5 @@ unsnap_panel(&mut commands, handles.root);
 
 ## Bevy 兼容版本
 
-当前依赖 Bevy ECS 0.20；工具链通过 `rust-toolchain.toml` 固定 Rust 1.97.1。
-`inspector_protocol_server` 与调用方应使用同一 Bevy minor 版本，避免 ECS 类型不兼容。
+本 crate 不依赖任何 Bevy crate；工具链通过 `rust-toolchain.toml` 固定 Rust 1.97.1。
+颜色／向量字段的宏展开使用字段类型自身的数组访问接口，由使用者选择相应类型和依赖。
